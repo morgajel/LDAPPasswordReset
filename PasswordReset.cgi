@@ -1,276 +1,268 @@
-#!/usr/bin/perl -w
+#!/usr/bin/perl -wT
 # Created by David R. Moore - 2011-04-15
 # Modifications made by jmorgan  - 20120529
+# Refactored by jmorgan - 20130321
 use strict;
-use Net::LDAP;
 use CGI;
+use Config::IniFiles;
 use Crypt::Cracklib;
+use Data::Dumper;
+use Net::LDAP;
+use POSIX qw( strftime );
 
-my $port       = $ENV{'SERVER_PORT'};
-my $client     = $ENV{'REMOTE_ADDR'};
-my $properties = '/etc/PasswordReset/pr.properties';
-my (
-    $TODAY,   $TIMESTAMP, $deny,    $app,   $search_uid,
-    $ticket,  $dn,        $uid,     $email, $crypt_passwd,
-    $ustring, $custring,  $newpw_a, $newpw_b
-);
-my ( $sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst ) =
-  localtime(time);
-$mon  += 1;
-$year += 1900;
-if ( $mon <= 9 )  { $mon  = "0$mon"; }
-if ( $mday <= 9 ) { $mday = "0$mday"; }
-if ( $hour <= 9 ) { $hour = "0$hour"; }
-if ( $min <= 9 )  { $min  = "0$min"; }
-if ( $sec <= 9 )  { $sec  = "0$sec"; }
-$TODAY     = "$year-$mon-$mday";
-$TIMESTAMP = "$hour:$min:$sec";
+# Load our lovely configuration file
+my $mainconfig = Config::IniFiles->new( -file => '/etc/PasswordReset/properties.ini' );
 
-my %PROP    = &get_props($properties);
-my $bind    = $PROP{bind};
-my $log     = $PROP{log};
-my $logfile = $PROP{logfile};
-$logfile = "$logfile.$TODAY";
-my $pwadmin_pass = $PROP{pwadmin_pass};
-my $base         = $PROP{base};
-my $salt         = $PROP{salt};
-my $dictionary   = $PROP{dictionary};
-my $webaddress   = $PROP{webaddress};
-my $logo         = $PROP{logo};
-my $url          = $PROP{app_url};
-my $app_title    = $PROP{app_title};
-my $mot          = $PROP{app_mot};
-my $ssl          = $PROP{ssl};
-if ( ( $ssl eq '1' ) || ( $ssl =~ m/true/i ) || ( $ssl =~ m/on/i ) ) {
-    $app = "https://$webaddress/$url";
-    if ( $port ne '443' ) {
-        $deny = '1';
-    }
+# Configure Logging
+my $logfile = $mainconfig->val('main','logfile');
+if ($mainconfig->val('main','datestamp_log')){
+    my $date =  strftime "%F", localtime;
+    $logfile.="$date";
 }
-else {
-    $app = "http://$webaddress/$url";
+
+
+# Redirect if we want to guarantee SSL and it's not SSL.
+if ( defined $mainconfig->val('main','ssl') and $mainconfig->val('main','ssl_enabled') eq "true" and $ENV{'SERVER_PORT'}  ne '443'  ) {
+    print print_redirect($mainconfig);
+    exit;
 }
-my $exclude_users = $PROP{exclude_users};
-my $q             = CGI->new;
-$search_uid = $q->param('UID');
-$ticket     = $q->param('TICKET');
-$newpw_a    = $q->param('NEWPW');
-$newpw_b    = $q->param('NEWPW_CONFIRM');
 
-my $ldap = Net::LDAP->new('ldap.server') or die "$@";
+# Our super awesome CGI object.
+our $q         = CGI->new;
 
-print $q->header;
-print $q->start_html("$app_title"),
-  $q->img( { -src => "http://$webaddress/images/$logo", -align => 'TOP' } ),
-  $q->h1("$app_title");
-&app_notes();
+#Instnatiate our LDAP connection
+my $ldap = Net::LDAP->new( $mainconfig->val('main','ldap_host')) or die "$@";
+#FIXME set up proper credentials.
+#$ldap->bind( $mainconfig->val('main','binddn')  , password => $mainconfig->val('main','password') ) or die "couldn't connect to LDAP!";
+$ldap->bind ;
 
-$ldap->bind( "$bind", password => "$pwadmin_pass" );
 
-if ( ( !$q->param ) && ( !$deny ) ) {
-    print $q->start_form( -action => "$app" ),
-      "Username or Email Address: ", $q->textfield('UID'),
-      $q->submit( -name => 'Request Reset' ),
-      $q->end_form;
+#Start collecting our lovely page into the $content variable which we print out at the end.
+my $content= print_header($mainconfig);
+
+
+################################################################
+# Now onto the crux of the application
+
+
+# If no parameters exist, we presume that this is the default screen- the search form.
+if (!defined $q->param){
+    $content.=print_search_form();
+
+# If "Request Reset" is submitted, Then we know to start the process and examine their search term.
+# If we find their search term, we begin the reset process.
+} elsif ( defined $q->param('Request Reset')) {
+    #search for user, make sure they're not in excluded and send ticket.
+    my $user= ldap_search($mainconfig,$ldap, $q->param('searchterm')   ) ;
+    if (! defined $user){
+        # spit out "not found" error
+        $content.="user not found";
+
+    }elsif ( grep { /$user->get_value('uid')/ }   split(',',$mainconfig->val('main','excluded_users') )  ){
+        # This returns if you're trying to reset an excluded user
+            $content.= "You cannot reset the password for ".$q->param('searchterm').", but nice try!\n";
+
+    }else {
+        # User found and allowed.
+        $content.="user found and allowed";
+        #create token and send email
+        
+    }
+    
+
+# If "Confirm Account" is submitted, The user has clicked the link in the email.
+# We should verify their ticket and present them with the actual password reset form.
+} elsif ( defined $q->param('Confirm Account')) {
+
+
+# If "Change Password" is submitted, The user has submitted their new password.
+# We need to re-verify their ticket, confirm the passwords match, and that cracklib approves
+# otherwise redisplay the reset form.
+} elsif ( defined $q->param('Change Password')) {
+
+
+#ORIGINAL CODE
+#    if ( ( !$ticket ) && ($search_uid) && ( !$newpw_a ) && ( !$newpw_b ) ) {
+#        }
+#        else {
+#            if ( &ldap_uid_search( $search_uid, $ldap ) ) {
+#                my $RET = &ldap_uid_search( $search_uid, $ldap );
+#                ( $dn, $uid, $email, $crypt_passwd ) = split( /\|/, $RET );
+#                if ($uid) {
+#                    $crypt_passwd =~ s/\{crypt\}//;
+#                    $ustring = "$TODAY$uid$email$crypt_passwd";
+#                    $custring = crypt( $ustring, $salt );
+#                    &reply( $app, $email, $uid, $custring );
+#                    print
+#                      "An Email has been sent to the address owned by $uid.\n",
+#                      $q->br;
+#                }
+#                else {
+#
+#                    #print "$search_uid ?? $exclude_users\n";
+#                    print "Account not found!\n<br />\n";
+#                    print "<a href=\"$app\">Try Again?</a>\n<br />";
+#                    exit;
+#                }
+#            }
+#            else {
+#                print "LDAP Search Issue(s). (1)\n";
+#                exit 1;
+#            }
+#        }
+#    }
+#    elsif ( ($ticket) && ($search_uid) && ( !$newpw_a ) && ( !$newpw_b ) ) {
+#        print $q->start_form( -action => "$app" ),
+#          $q->hidden( -name => 'TICKET', -default => "$ticket" ),
+#          $q->hidden( -name => 'UID',    -default => "$uid" ),
+#          "NEW PASSWORD: ",     $q->password_field('NEWPW'),         $q->br,
+#          "CONFIRM PASSWORD: ", $q->password_field('NEWPW_CONFIRM'), $q->br,
+#          $q->submit( -name => 'COMMIT' ),
+#          $q->end_form;
+#    }
+#    elsif ( ($ticket) && ($search_uid) && ($newpw_a) && ($newpw_b) ) {
+#        if ( $newpw_a ne $newpw_b ) {
+#            print "Your Password fields did not match, <a href=\"Javascript:window.history.back()\">try again</a>.<br />\n";
+#            exit;
+#        }
+#        else {
+#            if ( fascist_check( $newpw_a, $dictionary ) ne 'ok' ) {
+#                print $q->p( "Password chosen is a dictionary word or its too easy to guess, <a href=\"Javascript:window.history.back()\">try again</a>.<br />\n"
+#                );
+#            }
+#            else {
+#                if ( &ldap_uid_search( $search_uid, $ldap ) ) {
+#                    my $RET = &ldap_uid_search( $search_uid, $ldap );
+#                    ( $dn, $uid, $email, $crypt_passwd ) = split( /\|/, $RET );
+#                    $crypt_passwd =~ s/\{crypt\}//;
+#                    $ustring = "$TODAY$uid$email$crypt_passwd";
+#                    $custring = crypt( $ustring, $salt );
+#                    if ( $ticket eq $custring ) {
+#                        my $STAT =
+#                          &ldap_passwd_change( $search_uid, $newpw_a, $salt,
+#                            $dn, $ldap );
+#                        if ( $STAT eq 'OK' ) {
+#                            print "PASSWORD HAS BEEN RESET.\n<br />";
+#                            if ( $log =~ m/^on$/i ) {
+#                                &logit( $logfile, "$TODAY", "$TIMESTAMP",
+#                                    $search_uid, $client, 'SUCCESS' );
+#                            }
+#                        }
+#                        else {
+#                            print
+#                              "PASSWORD COULD NOT BE RESET. ($STAT)\n<br />";
+#                        }
+#                    }
+#                    else {
+#                        print
+#"$hour: HAH! nice try but you're attempt to reset a password did not work!\n";
+#                        if ( $log =~ m/^on$/i ) {
+#                            &logit( $logfile, "$TODAY", "$TIMESTAMP",
+#                                $search_uid, $client, 'FAIL (BAD TICKET)' );
+#                        }
+#                        exit;
+#                    }
+#                }
+#                else {
+#                    print "LDAP Search Issue(s). (2)\n";
+#                }
+#            }
+#        }
+#    }
+#}
+#else {
 }
-elsif ( ( $q->param ) && ( !$deny ) ) {
-    no warnings 'uninitialized';
-    if ( ( !$ticket ) && ($search_uid) && ( !$newpw_a ) && ( !$newpw_b ) ) {
-        if ( $exclude_users =~ m/$search_uid/ ) {
-            print
-              "You cannot reset the password for $search_uid, but nice try!\n";
-            if ( $log =~ m/^on$/i ) {
-                &logit( $logfile, "$TODAY", "$TIMESTAMP", $search_uid, $client,
-                    'FAIL (EXCLUDED)' );
-            }
-            exit;
-        }
-        else {
-            if ( &ldap_uid_search( $search_uid, $ldap ) ) {
-                my $RET = &ldap_uid_search( $search_uid, $ldap );
-                ( $dn, $uid, $email, $crypt_passwd ) = split( /\|/, $RET );
-                if ($uid) {
-                    $crypt_passwd =~ s/\{crypt\}//;
-                    $ustring = "$TODAY$uid$email$crypt_passwd";
-                    $custring = crypt( $ustring, $salt );
-                    &reply( $app, $email, $uid, $custring );
-                    print
-                      "An Email has been sent to the address owned by $uid.\n",
-                      $q->br;
-                }
-                else {
 
-                    #print "$search_uid ?? $exclude_users\n";
-                    print "Account not found!\n<br />\n";
-                    print "<a href=\"$app\">Try Again?</a>\n<br />";
-                    exit;
-                }
-            }
-            else {
-                print "LDAP Search Issue(s). (1)\n";
-                exit 1;
-            }
-        }
-    }
-    elsif ( ($ticket) && ($search_uid) && ( !$newpw_a ) && ( !$newpw_b ) ) {
-        print $q->start_form( -action => "$app" ),
-          $q->hidden( -name => 'TICKET', -default => "$ticket" ),
-          $q->hidden( -name => 'UID',    -default => "$uid" ),
-          "NEW PASSWORD: ",     $q->password_field('NEWPW'),         $q->br,
-          "CONFIRM PASSWORD: ", $q->password_field('NEWPW_CONFIRM'), $q->br,
-          $q->submit( -name => 'COMMIT' ),
-          $q->end_form;
-    }
-    elsif ( ($ticket) && ($search_uid) && ($newpw_a) && ($newpw_b) ) {
-        if ( $newpw_a ne $newpw_b ) {
-            print
-"Your Password fields did not match, <a href=\"Javascript:window.history.back()\">try again</a>.<br />\n";
-            exit;
-        }
-        else {
-            if ( fascist_check( $newpw_a, $dictionary ) ne 'ok' ) {
-                print $q->p(
-"Password chosen is a dictionary word or its too easy to guess, <a href=\"Javascript:window.history.back()\">try again</a>.<br />\n"
-                );
-            }
-            else {
-                if ( &ldap_uid_search( $search_uid, $ldap ) ) {
-                    my $RET = &ldap_uid_search( $search_uid, $ldap );
-                    ( $dn, $uid, $email, $crypt_passwd ) = split( /\|/, $RET );
-                    $crypt_passwd =~ s/\{crypt\}//;
-                    $ustring = "$TODAY$uid$email$crypt_passwd";
-                    $custring = crypt( $ustring, $salt );
-                    if ( $ticket eq $custring ) {
-                        my $STAT =
-                          &ldap_passwd_change( $search_uid, $newpw_a, $salt,
-                            $dn, $ldap );
-                        if ( $STAT eq 'OK' ) {
-                            print "PASSWORD HAS BEEN RESET.\n<br />";
-                            if ( $log =~ m/^on$/i ) {
-                                &logit( $logfile, "$TODAY", "$TIMESTAMP",
-                                    $search_uid, $client, 'SUCCESS' );
-                            }
-                        }
-                        else {
-                            print
-                              "PASSWORD COULD NOT BE RESET. ($STAT)\n<br />";
-                        }
-                    }
-                    else {
-                        print
-"$hour: HAH! nice try but you're attempt to reset a password did not work!\n";
-                        if ( $log =~ m/^on$/i ) {
-                            &logit( $logfile, "$TODAY", "$TIMESTAMP",
-                                $search_uid, $client, 'FAIL (BAD TICKET)' );
-                        }
-                        exit;
-                    }
-                }
-                else {
-                    print "LDAP Search Issue(s). (2)\n";
-                }
-            }
-        }
-    }
+$ldap->unbind;
+print $content;
+print  $q->end_html;
+exit;
+
+
+###################################################################
+###################################################################
+###################################################################
+###################################################################
+# Subroutines go under here.
+
+
+# ORIGINAL CODE
+#sub ldap_passwd_change($$$$$) {
+#    my ( $search_uid, $newpw_a, $salt, $dn, $ldap ) = @_;
+#    my $STAT;
+#    my $crypt_pass = crypt( $newpw_a, $salt );
+#    my $crypt_pass_string = "\{crypt\}$crypt_pass";
+#    my $change =
+#      $ldap->modify( $dn,
+#        changes => [ replace => [ userPassword => "$crypt_pass_string" ] ] );
+#    if ($change) {
+#        $STAT = 'OK';
+#    }
+#    else {
+#        $STAT = 'FAIL';
+#    }
+#    return $STAT;
+#}
+#
+#sub reply($$$$) {
+#    my $MAILCMD = '/bin/mail -s';
+#    my ( $app, $email, $uid, $custring ) = @_;
+#    my $MAILMSG =
+#"To Reset you LDAP Password, follow this link: $app?UID=$uid&TICKET=$custring\n";
+#    my $MAILSUB = "Account: $uid";
+#    system("/bin/echo \"$MAILMSG\" |$MAILCMD \"$MAILSUB\" $email");
+#}
+#
+
+#################################
+# Clean Implementation Functions
+
+sub print_header {
+    my ($config)=@_;
+    my $content;
+    $content.= $q->header;
+    # FIXME Would thse be better served as a heredoc?
+    $content.=$q->start_html($config->val('main','title'));
+    $content.="<img src='".$config->val('main','logo')."' style='vertical-align:top' >";
+    $content.="<h1>".$config->val('main','title')."</h1>";
+    return $content;
 }
-else {
+
+sub print_search_form   {
+    my $content;
+    #TODO could this be templated?
+    $content.= $q->start_form( -action =>  );
+    $content.= "Username or Email Address: ";
+    $content.= $q->textfield('searchterm');
+    $content.= $q->submit( -name => 'Request Reset' );
+    $content.= $q->end_form;
+    return $content;
+}
+
+sub ldap_search {
+    my ($config,$ldap, $searchterm ) = @_;
+
+    my $search = $ldap->search(
+        'base'   => $config->val('main','base_dn'),
+        'filter' => "(|(uid=$searchterm)(mail=$searchterm))"
+    );
+    $search->code && die $search->error;
+
+    return $search->entry();
+}
+sub print_redirect {
+    my ($config)=@_;
+    my $app = "https://" .$config->val('main','url') ;
     print <<eoj;
+    <html><body>
     <b>PLEASE USE HTTPS</b>
     <script type="text/javascript">
         <!--
             window.location = "$app"
         //-->
     </script>
+    </body></html>
 eoj
-}
 
-$ldap->unbind;
 
-#print "UserID: $uid\nEmail: $email\nPassword: $crypt_passwd\n";
-#print "$uid$email$crypt_passwd";
-
-print $q->p($mot), $q->end_html;
-
-sub ldap_uid_search($$) {
-    my ( $search_uid, $ldap ) = @_;
-    my $search = $ldap->search(
-        base   => "$base",
-        filter => "(|(uid=$search_uid)(mail=$search_uid))"
-    );
-    $search->code && die $search->error;
-
-    foreach my $entry ( $search->entries ) {
-        $uid          = $entry->get_value('uid');
-        $email        = $entry->get_value('mail');
-        $crypt_passwd = $entry->get_value('userPassword');
-        $dn           = $entry->dn();
-    }
-    my $RETURN = "$dn|$uid|$email|$crypt_passwd";
-    return $RETURN;
-}
-
-sub ldap_passwd_change($$$$$) {
-    my ( $search_uid, $newpw_a, $salt, $dn, $ldap ) = @_;
-    my $STAT;
-    my $crypt_pass = crypt( $newpw_a, $salt );
-    my $crypt_pass_string = "\{crypt\}$crypt_pass";
-    my $change =
-      $ldap->modify( $dn,
-        changes => [ replace => [ userPassword => "$crypt_pass_string" ] ] );
-    if ($change) {
-        $STAT = 'OK';
-    }
-    else {
-        $STAT = 'FAIL';
-    }
-    return $STAT;
-}
-
-sub reply($$$$) {
-    my $MAILCMD = '/bin/mail -s';
-    my ( $app, $email, $uid, $custring ) = @_;
-    my $MAILMSG =
-"To Reset you LDAP Password, follow this link: $app?UID=$uid&TICKET=$custring\n";
-    my $MAILSUB = "Account: $uid";
-    system("/bin/echo \"$MAILMSG\" |$MAILCMD \"$MAILSUB\" $email");
-}
-
-sub get_props($) {
-    my %PROP;
-    my $properties = shift;
-
-    open( PROP, "<$properties" ) or die $!;
-    while (<PROP>) {
-        if ( ( $_ =~ m/^#/ ) || ( $_ =~ m/^\s*$/ ) ) {
-            next;
-        }
-        else {
-            my @bA = split( /=/, $_ );
-            if ( scalar(@bA) > 2 ) {
-                my $k = shift(@bA);
-                my $v = join( '=', @bA );
-                $PROP{$k} = $v;
-            }
-            else {
-                $PROP{$1} = $2 while m/(\S+)=(.*)/g;
-            }
-        }
-    }
-    close(PROP);
-    return %PROP;
-}
-
-sub logit() {
-    my ( $logfile, $TODAY, $TIMESTAMP, $uid, $client, $msg ) = @_;
-    open( LOG, ">>$logfile" ) or die "Cannot open $logfile $!\n";
-    print LOG "$TODAY $TIMESTAMP CHANGE $msg: $uid by $client\n";
-    close(LOG);
-}
-
-sub app_notes() {
-    print <<eot;
- \n
- <!-- LDAP_passwordReset Written by ---------------------------  2011-04-15 -->
- \n
-eot
 }
