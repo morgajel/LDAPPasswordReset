@@ -1,0 +1,12 @@
+[main]
+    logfile         = /var/log/passwordReset.log
+    datestamp_log   = true
+    ssl_enabled     = false
+    url             = http://ldap.example.com/cgi-bin/PasswordReset
+    logo            = http://ldap.example.com/images/PR.png
+    excluded_users  = root,bin
+    title           = LDAP Password Reset Tool
+    ldap_host       = ldap.example.com
+    binddn          = cn=LDAPPasswordReset,dc=example,dc=com
+    base_dn         = dc=example,dc=com
+
