@@ -9,4 +9,7 @@
     ldap_host       = ldap.example.com
     binddn          = cn=LDAPPasswordReset,dc=example,dc=com
     base_dn         = dc=example,dc=com
+    bind_pass       = secret
+    replyaddress    = nobody@noreply.com
+
 

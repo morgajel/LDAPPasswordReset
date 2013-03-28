@@ -7,8 +7,13 @@ use CGI;
 use Config::IniFiles;
 use Crypt::Cracklib;
 use Data::Dumper;
+use MIME::Base64;
+use MIME::Lite;
 use Net::LDAP;
 use POSIX qw( strftime );
+use Crypt::Eksblowfish::Bcrypt qw(bcrypt_hash);
+use Crypt::Random;
+$ENV{PATH}="";
 
 # Load our lovely configuration file
 my $mainconfig = Config::IniFiles->new( -file => '/etc/PasswordReset/properties.ini' );
@@ -28,64 +33,99 @@ if ( defined $mainconfig->val('main','ssl') and $mainconfig->val('main','ssl_ena
 }
 
 # Our super awesome CGI object.
-our $q         = CGI->new;
+my $q         = CGI->new;
+my $params= sanitize_inputs($q);
+
+
 
 #Instnatiate our LDAP connection
 my $ldap = Net::LDAP->new( $mainconfig->val('main','ldap_host')) or die "$@";
 #FIXME set up proper credentials.
-#$ldap->bind( $mainconfig->val('main','binddn')  , password => $mainconfig->val('main','password') ) or die "couldn't connect to LDAP!";
-$ldap->bind ;
+$ldap->bind( $mainconfig->val('main','binddn')  , password => $mainconfig->val('main','bind_pass') ) or die "couldn't connect to LDAP!";
+#$ldap->bind ;
 
 
 #Start collecting our lovely page into the $content variable which we print out at the end.
 my $content= print_header($mainconfig);
-
 
 ################################################################
 # Now onto the crux of the application
 
 
 # If no parameters exist, we presume that this is the default screen- the search form.
-if (!defined $q->param){
+if ($params->{'action'} eq 'default'){
     $content.=print_search_form();
 
 # If "Request Reset" is submitted, Then we know to start the process and examine their search term.
 # If we find their search term, we begin the reset process.
-} elsif ( defined $q->param('Request Reset')) {
+} elsif ( $params->{'action'} eq 'Request Reset') {
     #search for user, make sure they're not in excluded and send ticket.
-    my $user= ldap_search($mainconfig,$ldap, $q->param('searchterm')   ) ;
+    my $user= ldap_search($mainconfig,$ldap, $params->{'searchterm'}   ) ;
     if (! defined $user){
         # spit out "not found" error
-        $content.="user not found";
+        $content.="<div>User not found. Care to try again?</div>";
+        $content.=print_search_form();
 
     }elsif ( grep { /$user->get_value('uid')/ }   split(',',$mainconfig->val('main','excluded_users') )  ){
         # This returns if you're trying to reset an excluded user
-            $content.= "You cannot reset the password for ".$q->param('searchterm').", but nice try!\n";
+            $content.= "<pre>You cannot reset the password for ".$params->{'searchterm'}.", but nice try!</pre>";
+        $content.=print_search_form();
 
     }else {
         # User found and allowed.
-        $content.="user found and allowed";
+        $content.="An Email has been sent to the address owned by ".$user->get_value('uid').".\n",
+        send_email($mainconfig,$user);
+
         #create token and send email
-        
     }
+sub send_email{
+    my ($mainconfig,$user)=@_;
+    my $token=encode_base64(create_token($user));
+    my $uid=encode_base64($user->get_value('uid'));
+    my $url=$mainconfig->val('main','url')."?Confirm=true&uid=$uid&token=$token";
+
     
+    if ( $user->get_value('mail') =~/^([a-z0-9\.@-_]{3,})$/){
+        my $email=$1;
+        my $msg = MIME::Lite->new(
+                From    => $mainconfig->val('main','replyaddress'),
+                To      => $user->get_value('mail'),
+                Subject => 'Password reset for '.$mainconfig->val('main','title'),
+                Type    =>'multipart/related',
+                Data    => $content
+            );
+        $msg->attach(
+            Type => 'text/html',
+            Data => qq{
+                <body>
+                    Here is your <a href="$url">password reset link</a>. If you did not request it, you can ignore it.
+                </body>
+            },
+        );
+
+
+
+        $msg->send;
+    }
+}
+
+
 
 # If "Confirm Account" is submitted, The user has clicked the link in the email.
 # We should verify their ticket and present them with the actual password reset form.
-} elsif ( defined $q->param('Confirm Account')) {
+} elsif ( $params->{'action'} eq 'Confirm') {
 
 
 # If "Change Password" is submitted, The user has submitted their new password.
 # We need to re-verify their ticket, confirm the passwords match, and that cracklib approves
 # otherwise redisplay the reset form.
-} elsif ( defined $q->param('Change Password')) {
+} elsif ( $params->{'action'} eq 'Change Password') {
 
 
 #ORIGINAL CODE
 #    if ( ( !$ticket ) && ($search_uid) && ( !$newpw_a ) && ( !$newpw_b ) ) {
 #        }
 #        else {
-#            if ( &ldap_uid_search( $search_uid, $ldap ) ) {
 #                my $RET = &ldap_uid_search( $search_uid, $ldap );
 #                ( $dn, $uid, $email, $crypt_passwd ) = split( /\|/, $RET );
 #                if ($uid) {
@@ -204,15 +244,6 @@ exit;
 #    return $STAT;
 #}
 #
-#sub reply($$$$) {
-#    my $MAILCMD = '/bin/mail -s';
-#    my ( $app, $email, $uid, $custring ) = @_;
-#    my $MAILMSG =
-#"To Reset you LDAP Password, follow this link: $app?UID=$uid&TICKET=$custring\n";
-#    my $MAILSUB = "Account: $uid";
-#    system("/bin/echo \"$MAILMSG\" |$MAILCMD \"$MAILSUB\" $email");
-#}
-#
 
 #################################
 # Clean Implementation Functions
@@ -263,6 +294,46 @@ sub print_redirect {
     </script>
     </body></html>
 eoj
-
-
 }
+sub salt {
+    my $octet=Crypt::Random::makerandom_octet(Length=>16);
+    return $octet;
+}
+
+sub create_token{
+    my ($user)=@_;
+    my $date =  strftime "%F", localtime;
+    my $prehash=$date.$user->get_value('uid').$user->get_value('mail').$user->get_value('userPassword');
+        my $salt=salt();
+        my $token= bcrypt_hash({
+                        key_nul => 1,
+                        cost => 8,
+                        salt => $salt,
+                    }, $prehash);
+    return $token;
+}
+sub sanitize_inputs {
+    my ($q)=@_;
+    my $params={};
+    if (defined $q->param('Request Reset')){
+        $params->{'action'}='Request Reset';
+    } elsif (defined $q->param('Confirm')){
+        $params->{'action'}='Confirm';
+    } elsif (defined $q->param('Change Password')){
+        $params->{'action'}='Change Password';
+    }else{
+        $params->{'action'}='default';
+    }
+    if (defined $q->param('uid') and $q->param('uid')=~/^([a-z0-9\.]{3,})$/){
+        $params->{'uid'}=$1;
+    }
+    if (defined $q->param('token') and $q->param('token')=~/^([a-z0-9]{8,})$/){
+        $params->{'token'}=$1;
+    }
+    if (defined $q->param('searchterm') and $q->param('searchterm')=~/^([a-z0-9\.@-_]{3,})$/){
+        $params->{'searchterm'}=$1;
+    }
+    return $params;
+}
+
+
